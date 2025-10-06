@@ -2,11 +2,95 @@ import os
 import time
 import copy
 import argparse
+from pathlib import Path
 import numpy as np
 import torch
 import torch.nn as nn
 from torchvision.utils import save_image
+import yaml
 from utils import get_loops, get_dataset, get_network, get_eval_pool, evaluate_synset, get_daparam, match_loss, get_time, TensorDataset, epoch, DiffAugment, ParamDiffAug
+
+
+def set_global_seed(seed: int) -> None:
+    if seed is None:
+        return
+    if seed < 0:
+        return
+    import random
+
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def apply_yaml_config(args):
+    if not args.config:
+        return args
+
+    config_path = Path(args.config).expanduser().resolve()
+    if not config_path.exists():
+        raise FileNotFoundError(f"Config file not found: {config_path}")
+
+    with config_path.open('r', encoding='utf-8') as f:
+        cfg = yaml.safe_load(f) or {}
+
+    base_dir = config_path.parent
+
+    dataset_cfg = cfg.get('dataset', {})
+    if dataset_cfg:
+        if 'dataset' in dataset_cfg:
+            args.dataset = dataset_cfg['dataset']
+        if 'data_dir' in dataset_cfg:
+            data_dir = Path(dataset_cfg['data_dir'])
+            if not data_dir.is_absolute():
+                data_dir = (base_dir / data_dir).resolve()
+            args.data_path = str(data_dir)
+        args.covid_image_size = dataset_cfg.get('size', getattr(args, 'covid_image_size', 224))
+        args.batch_real = dataset_cfg.get('batch_real', args.batch_real)
+        args.covid_nch = dataset_cfg.get('nch', getattr(args, 'covid_nch', 1))
+        args.covid_nclass = dataset_cfg.get('nclass', getattr(args, 'covid_nclass', None))
+        args.noise_seed = dataset_cfg.get('noise_seed', args.noise_seed)
+
+    net_cfg = cfg.get('network', {})
+    if net_cfg:
+        args.model = 'COVIDConvNet'
+        args.covid_net_type = net_cfg.get('net_type', 'convnet')
+        args.covid_net_norm = net_cfg.get('norm_type', 'instance')
+        args.covid_net_depth = net_cfg.get('depth', getattr(args, 'covid_net_depth', 3))
+        args.covid_net_width = net_cfg.get('width', getattr(args, 'covid_net_width', 1.0))
+
+    cond_cfg = cfg.get('condense', {})
+    if cond_cfg:
+        args.ipc = cond_cfg.get('ipc', args.ipc)
+        args.Iteration = cond_cfg.get('niter', args.Iteration)
+        args.num_eval = cond_cfg.get('num_premodel', args.num_eval)
+        args.covid_factor = cond_cfg.get('factor', getattr(args, 'covid_factor', None))
+        args.decode_type = cond_cfg.get('decode_type', getattr(args, 'decode_type', None))
+
+    opt_cfg = cfg.get('optimization', {})
+    if opt_cfg:
+        args.lr_img = opt_cfg.get('lr_img', args.lr_img)
+        args.mom_img = opt_cfg.get('mom_img', args.mom_img)
+        if 'optimizer' in opt_cfg:
+            args.optimizer_img_type = opt_cfg['optimizer']
+
+    train_cfg = cfg.get('train', {})
+    if train_cfg:
+        args.epoch_eval_train = train_cfg.get('evaluation_epochs', args.epoch_eval_train)
+        args.num_eval = train_cfg.get('model_num', args.num_eval)
+
+    aug_cfg = cfg.get('augmentation', {})
+    if aug_cfg:
+        if aug_cfg.get('dsa', args.method == 'DSA'):
+            args.method = 'DSA'
+        else:
+            args.method = 'DC'
+        if 'dsa_strategy' in aug_cfg:
+            args.dsa_strategy = aug_cfg['dsa_strategy']
+
+    return args
 
 
 def main():
@@ -30,8 +114,17 @@ def main():
     parser.add_argument('--data_path', type=str, default='data', help='dataset path')
     parser.add_argument('--save_path', type=str, default='result', help='path to save results')
     parser.add_argument('--dis_metric', type=str, default='ours', help='distance metric')
+    parser.add_argument('--config', type=str, default=None, help='Path to YAML config (e.g., edit-ref/covid.yaml)')
+    parser.add_argument('--noise_type', type=str, default='none', choices=['none', 'uniform', 'pairflip', 'asymmetric'], help='Label noise type for real dataset')
+    parser.add_argument('--noise_level', type=float, default=0.0, help='Label noise level (0-1)')
+    parser.add_argument('--noise_seed', type=int, default=123, help='Random seed for label noise injection (negative to disable)')
+    parser.add_argument('--eval_repeats', type=int, default=None, help='Number of evaluation repeats')
+    parser.add_argument('--eval_seed', type=int, default=0, help='Base seed for evaluation repeats (set negative to disable)')
+    parser.add_argument('--train_seed', type=int, default=None, help='Base seed for condensation training (negative for no control)')
 
     args = parser.parse_args()
+    args = apply_yaml_config(args)
+    set_global_seed(args.train_seed)
     args.outer_loop, args.inner_loop = get_loops(args.ipc)
     args.device = 'cuda' if torch.cuda.is_available() else 'cpu'
     args.dsa_param = ParamDiffAug()
@@ -45,7 +138,13 @@ def main():
 
     eval_it_pool = np.arange(0, args.Iteration+1, 500).tolist() if args.eval_mode == 'S' or args.eval_mode == 'SS' else [args.Iteration] # The list of iterations when we evaluate models and record results.
     print('eval_it_pool: ', eval_it_pool)
-    channel, im_size, num_classes, class_names, mean, std, dst_train, dst_test, testloader = get_dataset(args.dataset, args.data_path)
+    channel, im_size, num_classes, class_names, mean, std, dst_train, dst_test, testloader = get_dataset(
+        args.dataset,
+        args.data_path,
+        noise_type=args.noise_type,
+        noise_level=args.noise_level,
+        noise_seed=args.noise_seed,
+    )
     model_eval_pool = get_eval_pool(args.eval_mode, args.model, args.model)
 
 
@@ -122,13 +221,21 @@ def main():
                     else:
                         args.epoch_eval_train = 300
 
+                    repeats = args.eval_repeats if args.eval_repeats is not None else args.num_eval
                     accs = []
-                    for it_eval in range(args.num_eval):
+                    for it_eval in range(repeats):
+                        eval_seed = None
+                        if args.eval_seed is not None and args.eval_seed >= 0:
+                            eval_seed = args.eval_seed + it_eval
+                        if eval_seed is not None:
+                            set_global_seed(eval_seed)
                         net_eval = get_network(model_eval, channel, num_classes, im_size).to(args.device) # get a random model
                         image_syn_eval, label_syn_eval = copy.deepcopy(image_syn.detach()), copy.deepcopy(label_syn.detach()) # avoid any unaware modification
                         _, acc_train, acc_test = evaluate_synset(it_eval, net_eval, image_syn_eval, label_syn_eval, testloader, args)
                         accs.append(acc_test)
-                    print('Evaluate %d random %s, mean = %.4f std = %.4f\n-------------------------'%(len(accs), model_eval, np.mean(accs), np.std(accs)))
+                    mean_acc = float(np.mean(accs)) if len(accs) > 0 else 0.0
+                    std_acc = float(np.std(accs)) if len(accs) > 1 else 0.0
+                    print('Evaluate %d random %s, mean acc = %.4f std = %.4f\n-------------------------'%(len(accs), model_eval, mean_acc, std_acc))
 
                     if it == args.Iteration: # record the final results
                         accs_all_exps[model_eval] += accs

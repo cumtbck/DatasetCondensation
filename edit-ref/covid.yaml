@@ -1,0 +1,77 @@
+distibution_train:
+  backend: 'nccl' #  choices=['nccl', 'gloo', 'mpi', 'torch']
+  init_method: 'env://'
+  workers: 8
+
+dataset:
+  dataset: covid
+  nclass: 4
+  size: 224
+  data_dir: '..'
+  load_memory: true
+  batch_real: 512
+  nch: 1
+
+network:
+  net_type: convnet
+  norm_type: instance
+  depth: 3
+  width: 1.0
+
+train:
+  evaluation_epochs: 2000
+  epoch_print_freq: 10
+  epoch_eval_interval: 100
+  pertrain_epochs: 60
+  batch_size: 64
+  lr: 0.01
+  adamw_lr: 0.001    
+  eval_optimizer: adamw
+  momentum: 0.9
+  weight_decay: 5e-4
+  seed: 10
+  model_num: 20
+
+
+augmentation:
+  mixup: cut
+  beta: 1.0
+  mix_p: 0.5
+  rrc: True
+  dsa: true
+  # 基础 DSA 策略中移除 flip & rotate
+  dsa_strategy: "crop_cutout_flip_scale_rotate"  # 原: crop_cutout_flip_scale_rotate
+  # condense 阶段同样去掉 flip/rotate，统一放到 classwise 几何增强里
+  aug_type: 'crop_cutout_scale'       # 原: crop_cutout_flip
+  # 新增：分类别增强相关配置
+  classwise_aug: true          # 是否在 diffaug 阶段按类别追加随机旋转/翻转
+  augment_classes: [0,1,3]      # 需要额外随机增强的类别
+  diffaug_seed: 0721            # 设定 diffaug 随机种子保证可复现
+  normalize_location: 'dataset' # 'dataset' 表示在 dataset-level 已 Normalize，diffaug 不再二次 Normalize
+  rotation_deg: 20              # 文献设定: ±20° 只在 classwise 中使用 (水平+垂直翻转)
+
+optimization:
+  optimizer: adamw
+  lr_scale_adam: 0.1
+  lr_img: 0.01 
+  mom_img: 0.5
+  lr_sampling_net: 1e-3
+
+save_path:
+  save_dir: "../results/condense"
+  pretrain_dir: '../pretrained_models'
+
+condense:
+  ipc: 10
+  num_premodel: 20
+  niter: 20000
+  iter_calib: 1 
+  calib_weight: 1
+  sampling_net: True
+  num_freqs: 4096
+  dis_metrics: "NCFM"
+  factor: 2
+  alpha_for_loss: 0.5
+  beta_for_loss: 0.5
+  decode_type: 'single' # choices=['single', 'multi', 'bound']
+  teacher_model_epoch: 20

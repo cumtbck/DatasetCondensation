@@ -8,8 +8,50 @@ from torch.utils.data import Dataset
 from torchvision import datasets, transforms
 from scipy.ndimage.interpolation import rotate as scipyrotate
 from networks import MLP, ConvNet, LeNet, AlexNet, AlexNetBN, VGG11, VGG11BN, ResNet18, ResNet18BN_AP, ResNet18BN
+from edit_ref.covid import CombinedCOVID19Dataset
+from edit_ref.utils import load_resized_data as load_covid_data
+from edit_ref.convnet import ConvNet as COVIDConvNet
+from edit_ref.noise import noisify_with_P, noisify_pairflip, noisify_covid_asymmetric
 
-def get_dataset(dataset, data_path):
+def _apply_noise_to_dataset(dst_train, noise_type, noise_level, num_classes, random_state=123):
+    if noise_type == 'none' or noise_level <= 0:
+        return dst_train
+
+    if hasattr(dst_train, 'get_data_labels'):
+        labels_source = dst_train.get_data_labels()
+    elif hasattr(dst_train, 'targets'):
+        labels_source = dst_train.targets
+    elif hasattr(dst_train, 'labels'):
+        labels_source = dst_train.labels
+    else:
+        return dst_train
+
+    labels = np.array(labels_source)
+    eps = 1e-6
+    if noise_type == 'uniform':
+        noise_labels, _, _ = noisify_with_P(labels, nb_classes=num_classes, noise=noise_level, random_state=random_state)
+    elif noise_type == 'pairflip':
+        noise_labels, _, _ = noisify_pairflip(labels, nb_classes=num_classes, noise=noise_level, random_state=random_state)
+    else:
+        noise_labels, _, _ = noisify_covid_asymmetric(labels, noise=noise_level, random_state=random_state)
+
+    if hasattr(dst_train, 'update_corrupted_label'):
+        dst_train.update_corrupted_label(noise_labels)
+        noise_softlabel = np.ones((len(noise_labels), num_classes), dtype=np.float32) * eps / (num_classes - 1)
+        for idx, label in enumerate(noise_labels):
+            noise_softlabel[idx, label] = 1 - eps
+        if hasattr(dst_train, 'update_corrupted_softlabel'):
+            dst_train.update_corrupted_softlabel(noise_softlabel)
+    else:
+        if hasattr(dst_train, 'targets'):
+            dst_train.targets = noise_labels.tolist()
+        elif hasattr(dst_train, 'labels'):
+            dst_train.labels = noise_labels.tolist()
+
+    return dst_train
+
+
+def get_dataset(dataset, data_path, noise_type='none', noise_level=0.0, load_memory=False, batch_real=256, noise_seed=123):
     if dataset == 'MNIST':
         channel = 1
         im_size = (28, 28)
@@ -93,6 +135,16 @@ def get_dataset(dataset, data_path):
 
         dst_test = TensorDataset(images_val, labels_val)  # no augmentation
 
+    elif dataset.lower() == 'covid':
+        train_set, val_set = load_covid_data('covid', data_path)
+        channel = 1
+        im_size = (train_set[0][0].shape[-2], train_set[0][0].shape[-1])
+        num_classes = 4
+        mean = [0.5094]
+        std = [0.2532]
+        dst_train = _apply_noise_to_dataset(train_set, noise_type, noise_level, num_classes, random_state=noise_seed)
+        dst_test = val_set
+        class_names = list(CombinedCOVID19Dataset.classes)
     else:
         exit('unknown dataset: %s'%dataset)
 
@@ -193,6 +245,16 @@ def get_network(model, channel, num_classes, im_size=(32, 32)):
     elif model == 'ConvNetAP':
         net = ConvNet(channel=channel, num_classes=num_classes, net_width=net_width, net_depth=net_depth, net_act=net_act, net_norm=net_norm, net_pooling='avgpooling', im_size=im_size)
 
+    elif model == 'COVIDConvNet':
+        width = net_width if isinstance(net_width, int) else int(128)
+        net = COVIDConvNet(
+            num_classes=num_classes,
+            net_norm='instance',
+            net_depth=3,
+            net_width=width,
+            channel=channel,
+            im_size=im_size,
+        )
     else:
         net = None
         exit('unknown model: %s'%model)
